@@ -1,0 +1,135 @@
+---
+# retry_join в vault.hcl заставляет follower-ноды САМИ присоединиться к
+# Raft-кластеру — но лидер должен быть unsealed, чтобы вообще принимать
+# join-запросы. Поэтому порядок строго такой:
+#   1) init (один раз, на лидере, если ещё не делали)
+#   2) unseal ЛИДЕРА и явное ожидание, что он реально стал unsealed
+#      (это барьер: все хосты дожидаются этого шага, прежде чем
+#      продолжить — иначе follower-ы будут пытаться присоединиться
+#      к ещё запечатанному лидеру и вечно получать "503 Vault is sealed")
+#   3) только теперь follower-ы ждут join и распечатываются
+
+- name: Check whether local init file already exists (control node)
+  ansible.builtin.stat:
+    path: "{{ vault_secrets_local_dir }}/vault-init.json"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: vault_init_file
+
+- name: Check current Vault status on this node
+  ansible.builtin.command: vault status -format=json
+  environment: "{{ vault_env }}"
+  register: vault_status_raw
+  changed_when: false
+  failed_when: false
+
+- name: Parse Vault status
+  ansible.builtin.set_fact:
+    vault_status: "{{ vault_status_raw.stdout | from_json }}"
+
+- name: Initialize the cluster (only on the leader, only if truly not done yet)
+  ansible.builtin.command: >
+    vault operator init
+    -key-shares={{ vault_unseal_key_shares }}
+    -key-threshold={{ vault_unseal_key_threshold }}
+    -format=json
+  environment: "{{ vault_env }}"
+  register: vault_init_raw
+  when:
+    - inventory_hostname == groups['vaults'][0]
+    - not vault_status.initialized
+    - not vault_init_file.stat.exists
+  run_once: true
+
+- name: Persist init output locally (control node only, mode 0600) — KEEP SECRET, do not commit
+  ansible.builtin.copy:
+    content: "{{ vault_init_raw.stdout }}"
+    dest: "{{ vault_secrets_local_dir }}/vault-init.json"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: vault_init_raw is not skipped
+
+- name: Re-check local init file (in case we just created it above)
+  ansible.builtin.stat:
+    path: "{{ vault_secrets_local_dir }}/vault-init.json"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: vault_init_file2
+
+- name: Load unseal keys from the local init file (works on every run, not just the first)
+  ansible.builtin.set_fact:
+    vault_init_result: "{{ lookup('ansible.builtin.file', vault_secrets_local_dir + '/vault-init.json') | from_json }}"
+  when: vault_init_file2.stat.exists
+
+- name: Fail clearly if we have no keys at all and something needs unsealing
+  ansible.builtin.fail:
+    msg: >-
+      Нет локального файла с unseal-ключами
+      ({{ vault_secrets_local_dir }}/vault-init.json). Кластер либо
+      инициализирован не через эту роль, либо файл был удалён/перемещён.
+  when:
+    - vault_status.sealed
+    - vault_init_result is not defined
+
+# --- Шаг 1: распечатываем ТОЛЬКО лидера ---
+
+- name: Unseal the leader node (it already has local raft data, no join needed)
+  ansible.builtin.command: "vault operator unseal {{ item }}"
+  environment: "{{ vault_env }}"
+  loop: "{{ vault_init_result.unseal_keys_hex[:vault_unseal_key_threshold] }}"
+  when:
+    - inventory_hostname == groups['vaults'][0]
+    - vault_init_result is defined
+  no_log: true
+
+- name: Barrier — wait until the leader is confirmed unsealed before followers try to join
+  ansible.builtin.command: vault status -format=json
+  environment: "{{ vault_env }}"
+  register: vault_leader_status
+  until: not (vault_leader_status.stdout | from_json).sealed
+  retries: 15
+  delay: 3
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == groups['vaults'][0]
+  # Только лидер выполняет эту задачу — но Ansible (linear strategy) всё
+  # равно не пустит follower-хосты дальше, пока эта задача не завершится
+  # на лидере. Это и есть барьер, который чинит deadlock.
+
+# --- Шаг 2: теперь follower-ы ждут join и распечатываются ---
+
+- name: Wait until follower nodes have actually joined the Raft cluster
+  ansible.builtin.command: vault status -format=json
+  environment: "{{ vault_env }}"
+  register: vault_status_wait
+  until: (vault_status_wait.stdout | from_json).initialized
+  retries: 20
+  delay: 5
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname != groups['vaults'][0]
+
+- name: Fail clearly if a follower never joined the Raft cluster in time
+  ansible.builtin.fail:
+    msg: >-
+      Нода не присоединилась к Raft-кластеру через retry_join за отведённое
+      время. Проверь: (1) сетевую доступность до лидера на портах
+      8200/8201, (2) что leader_ca_cert_file указывает на актуальный
+      ca.crt, (3) что лидер сейчас реально unsealed.
+  when:
+    - inventory_hostname != groups['vaults'][0]
+    - not (vault_status_wait.stdout | from_json).initialized
+
+- name: Unseal follower nodes
+  ansible.builtin.command: "vault operator unseal {{ item }}"
+  environment: "{{ vault_env }}"
+  loop: "{{ vault_init_result.unseal_keys_hex[:vault_unseal_key_threshold] }}"
+  when:
+    - inventory_hostname != groups['vaults'][0]
+    - vault_init_result is defined
+    - (vault_status_wait.stdout | from_json).sealed
+  no_log: true

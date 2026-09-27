@@ -1,0 +1,5 @@
+---
+vault_data_dir: /opt/vault/data
+vault_tls_dir: /opt/vault/tls
+
+vault_pki_local_dir: "{{ lookup('env', 'HOME') }}/vault-lab-secrets/pki"

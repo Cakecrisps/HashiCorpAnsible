@@ -1,0 +1,76 @@
+---
+- name: Install prerequisites (gnupg needed to dearmor the apt key)
+  ansible.builtin.apt:
+    name:
+      - gnupg
+      - ca-certificates
+      - lsb-release
+    state: present
+    update_cache: true
+
+- name: Download HashiCorp apt GPG key
+  ansible.builtin.get_url:
+    url: https://apt.releases.hashicorp.com/gpg
+    dest: /tmp/hashicorp.gpg.asc
+    mode: "0644"
+
+- name: Dearmor HashiCorp GPG key into keyring
+  ansible.builtin.command: >
+    gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    /tmp/hashicorp.gpg.asc
+  args:
+    creates: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+- name: Add HashiCorp apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg]
+      https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main
+    filename: hashicorp
+    state: present
+
+- name: Install vault package
+  ansible.builtin.apt:
+    name: vault
+    state: present
+    update_cache: true
+
+- name: Create Vault data directory (Raft storage)
+  ansible.builtin.file:
+    path: "{{ vault_data_dir }}"
+    state: directory
+    owner: vault
+    group: vault
+    mode: "0750"
+
+- name: Create Vault TLS directory
+  ansible.builtin.file:
+    path: "{{ vault_tls_dir }}"
+    state: directory
+    owner: vault
+    group: vault
+    mode: "0750"
+
+- name: Generate and distribute TLS material
+  ansible.builtin.include_tasks: tls.yml
+
+- name: Deploy vault.hcl configuration
+  ansible.builtin.template:
+    src: vault.hcl.j2
+    dest: /etc/vault.d/vault.hcl
+    owner: vault
+    group: vault
+    mode: "0640"
+  notify: Restart vault
+
+- name: Allow Vault binary to lock memory (mlock) without running as root
+  community.general.capabilities:
+    path: /usr/bin/vault
+    capability: cap_ipc_lock+ep
+    state: present
+
+- name: Enable and start Vault service
+  ansible.builtin.systemd:
+    name: vault
+    enabled: true
+    state: started

@@ -1,0 +1,39 @@
+---
+- name: Install nginx (nginx-full — тянет модуль stream как зависимость)
+  ansible.builtin.apt:
+    name: nginx-full
+    state: present
+    update_cache: true
+
+- name: Check whether stream module is shipped as a dynamic module
+  ansible.builtin.stat:
+    path: /usr/lib/nginx/modules/ngx_stream_module.so
+  register: nginx_stream_module
+
+- name: Fail with a clear message if stream module is missing entirely
+  ansible.builtin.fail:
+    msg: >-
+      Модуль stream не найден ни как встроенный, ни как динамический
+      (/usr/lib/nginx/modules/ngx_stream_module.so отсутствует).
+      Проверь, что реально установился именно nginx-full, а не
+      nginx-light: dpkg -l | grep nginx
+  when:
+    - not nginx_stream_module.stat.exists
+
+- name: Deploy nginx.conf with stream passthrough to Vault cluster
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/nginx.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "nginx -t -c %s"
+  vars:
+    nginx_has_dynamic_stream_module: "{{ nginx_stream_module.stat.exists }}"
+  notify: Reload nginx
+
+- name: Enable and start nginx
+  ansible.builtin.systemd:
+    name: nginx
+    enabled: true
+    state: started

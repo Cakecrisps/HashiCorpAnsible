@@ -1,0 +1,19 @@
+---
+- name: Create HashiCorp vault
+  hosts: vaults
+  become: true
+
+  roles:
+    - vault_node
+  
+- name: Vault cluster — init and unseal
+  hosts: vaults
+  become: true
+  roles:
+    - vault_init
+
+- name: NginxLb
+  hosts: nginx_lb
+  become: true
+  roles:
+    - nginx_lb

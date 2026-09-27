@@ -1,0 +1,107 @@
+---
+
+- name: Create local PKI working directory
+  ansible.builtin.file:
+    path: "{{ vault_pki_local_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Generate CA private key
+  community.crypto.openssl_privatekey:
+    path: "{{ vault_pki_local_dir }}/ca.key"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Generate CA CSR (self-signed root)
+  community.crypto.openssl_csr:
+    path: "{{ vault_pki_local_dir }}/ca.csr"
+    privatekey_path: "{{ vault_pki_local_dir }}/ca.key"
+    common_name: "Vault Lab Root CA"
+    basic_constraints: ["CA:TRUE"]
+    basic_constraints_critical: true
+    key_usage: ["keyCertSign", "cRLSign"]
+    key_usage_critical: true
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Self-sign CA certificate
+  community.crypto.x509_certificate:
+    path: "{{ vault_pki_local_dir }}/ca.crt"
+    csr_path: "{{ vault_pki_local_dir }}/ca.csr"
+    privatekey_path: "{{ vault_pki_local_dir }}/ca.key"
+    provider: selfsigned
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Generate shared Vault server private key
+  community.crypto.openssl_privatekey:
+    path: "{{ vault_pki_local_dir }}/vault.key"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Build list of SANs for all Vault nodes
+  ansible.builtin.set_fact:
+    vault_san_list: >-
+      {{
+        (groups['vaults'] | map('extract', hostvars, 'ansible_host')
+          | map('regex_replace', '^(.*)$', 'IP:\1') | list)
+        + ['DNS:localhost', 'IP:127.0.0.1']
+      }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Generate CSR for shared Vault server cert (multi-SAN)
+  community.crypto.openssl_csr:
+    path: "{{ vault_pki_local_dir }}/vault.csr"
+    privatekey_path: "{{ vault_pki_local_dir }}/vault.key"
+    common_name: "vault.lab.local"
+    subject_alt_name: "{{ vault_san_list }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Sign Vault server certificate with lab CA
+  community.crypto.x509_certificate:
+    path: "{{ vault_pki_local_dir }}/vault.crt"
+    csr_path: "{{ vault_pki_local_dir }}/vault.csr"
+    provider: ownca
+    ownca_path: "{{ vault_pki_local_dir }}/ca.crt"
+    ownca_privatekey_path: "{{ vault_pki_local_dir }}/ca.key"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Copy CA certificate to node (needed for retry_join to trust peers)
+  ansible.builtin.copy:
+    src: "{{ vault_pki_local_dir }}/ca.crt"
+    dest: "{{ vault_tls_dir }}/ca.crt"
+    owner: vault
+    group: vault
+    mode: "0644"
+  notify: Restart vault
+
+- name: Copy TLS certificate to node
+  ansible.builtin.copy:
+    src: "{{ vault_pki_local_dir }}/vault.crt"
+    dest: "{{ vault_tls_dir }}/vault.crt"
+    owner: vault
+    group: vault
+    mode: "0644"
+  notify: Restart vault
+
+- name: Copy TLS private key to node
+  ansible.builtin.copy:
+    src: "{{ vault_pki_local_dir }}/vault.key"
+    dest: "{{ vault_tls_dir }}/vault.key"
+    owner: vault
+    group: vault
+    mode: "0640"
+  notify: Restart vault
