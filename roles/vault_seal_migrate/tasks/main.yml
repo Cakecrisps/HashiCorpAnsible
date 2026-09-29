@@ -1,0 +1,53 @@
+---
+- name: Deploy Transit seal configuration on this node
+  ansible.builtin.include_role:
+    name: vault_node
+
+- name: Restart this node with Transit seal configuration
+  ansible.builtin.meta: flush_handlers
+
+- name: Read post-restart seal status
+  ansible.builtin.command: vault status -format=json
+  environment:
+    VAULT_ADDR: https://127.0.0.1:8200
+    VAULT_CACERT: /opt/vault/tls/ca.crt
+  register: migration_status_raw
+  changed_when: false
+  failed_when: false
+
+- name: Require a valid status after restart
+  ansible.builtin.assert:
+    that: migration_status_raw.stdout | from_json is mapping
+    fail_msg: Vault не отвечает после смены seal. Проверьте journalctl -u vault.
+
+- name: Migrate Shamir shares to Transit recovery keys
+  ansible.builtin.command: "vault operator unseal -migrate {{ item }}"
+  environment:
+    VAULT_ADDR: https://127.0.0.1:8200
+    VAULT_CACERT: /opt/vault/tls/ca.crt
+  loop: "{{ (lookup('ansible.builtin.file', lookup('env', 'HOME') + '/vault-lab-secrets/vault-init.json') | from_json).unseal_keys_hex[:3] }}"
+  when: (migration_status_raw.stdout | from_json).sealed
+  no_log: true
+
+- name: Wait for node to become unsealed after migration
+  ansible.builtin.command: vault status -format=json
+  environment:
+    VAULT_ADDR: https://127.0.0.1:8200
+    VAULT_CACERT: /opt/vault/tls/ca.crt
+  register: migration_ready_raw
+  until: migration_ready_raw.stdout | length > 0 and not (migration_ready_raw.stdout | from_json).sealed
+  retries: 20
+  delay: 3
+  changed_when: false
+
+- name: Read seal type from Vault API
+  ansible.builtin.uri:
+    url: https://127.0.0.1:8200/v1/sys/seal-status
+    ca_path: /opt/vault/tls/ca.crt
+    status_code: 200
+  register: migration_seal_status
+
+- name: Require Transit seal on migrated node
+  ansible.builtin.assert:
+    that: migration_seal_status.json.type == 'transit'
+    fail_msg: Нода unsealed, но seal_type не transit.

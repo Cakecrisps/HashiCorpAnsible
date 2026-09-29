@@ -1,0 +1,84 @@
+---
+- name: Check Transit provider and back up Raft before seal migration
+  hosts: Vault1
+  become: true
+  vars:
+    migration_secrets_dir: "{{ lookup('env', 'HOME') }}/vault-lab-secrets"
+    migration_env:
+      VAULT_ADDR: https://127.0.0.1:8200
+      VAULT_CACERT: /opt/vault/tls/ca.crt
+      VAULT_TOKEN: "{{ (lookup('ansible.builtin.file', migration_secrets_dir + '/vault-init.json') | from_json).root_token }}"
+  tasks:
+    - name: Verify Transit Vault TLS and availability from main cluster
+      ansible.builtin.uri:
+        url: https://192.168.122.34:8200/v1/sys/health
+        ca_path: /opt/vault/tls/ca.crt
+        status_code: 200
+      register: transit_health
+
+    - name: Verify seal token can encrypt with Transit
+      ansible.builtin.uri:
+        url: https://192.168.122.34:8200/v1/transit/encrypt/autounseal
+        method: POST
+        ca_path: /opt/vault/tls/ca.crt
+        body_format: json
+        body:
+          plaintext: dGVzdA==
+        headers:
+          X-Vault-Token: "{{ lookup('ansible.builtin.file', migration_secrets_dir + '/transit-seal.token') | trim }}"
+        status_code: 200
+      no_log: true
+
+    - name: Check existing pre-migration snapshot
+      ansible.builtin.stat:
+        path: "{{ migration_secrets_dir }}/vault-pre-transit.snap"
+      delegate_to: localhost
+      become: false
+      register: migration_snapshot_file
+
+    - name: Save pre-migration Raft snapshot on leader
+      ansible.builtin.command: vault operator raft snapshot save /tmp/vault-pre-transit.snap
+      environment: "{{ migration_env }}"
+      no_log: true
+      when: not migration_snapshot_file.stat.exists
+
+    - name: Restrict remote snapshot permissions
+      ansible.builtin.file:
+        path: /tmp/vault-pre-transit.snap
+        owner: root
+        group: root
+        mode: "0600"
+      when: not migration_snapshot_file.stat.exists
+
+    - name: Copy snapshot to control node
+      ansible.builtin.fetch:
+        src: /tmp/vault-pre-transit.snap
+        dest: "{{ migration_secrets_dir }}/vault-pre-transit.snap"
+        flat: true
+      no_log: true
+      when: not migration_snapshot_file.stat.exists
+
+    - name: Restrict local snapshot permissions
+      ansible.builtin.file:
+        path: "{{ migration_secrets_dir }}/vault-pre-transit.snap"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      when: not migration_snapshot_file.stat.exists
+
+- name: Migrate standby nodes to Transit seal one at a time
+  hosts: Vault2:Vault3
+  serial: 1
+  become: true
+  vars:
+    vault_transit_seal_enabled: true
+  roles:
+    - vault_seal_migrate
+
+- name: Migrate former leader after standbys are ready
+  hosts: Vault1
+  become: true
+  vars:
+    vault_transit_seal_enabled: true
+  roles:
+    - vault_seal_migrate

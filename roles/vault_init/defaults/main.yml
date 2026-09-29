@@ -4,6 +4,7 @@ vault_unseal_key_threshold: 3
 
 vault_secrets_local_dir: "{{ lookup('env', 'HOME') }}/vault-lab-secrets"
 vault_tls_dir: /opt/vault/tls
+vault_transit_seal_enabled: false
 
 vault_env:
   VAULT_ADDR: "https://127.0.0.1:8200"

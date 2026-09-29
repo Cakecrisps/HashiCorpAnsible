@@ -54,6 +54,10 @@
 - name: Generate and distribute TLS material
   ansible.builtin.include_tasks: tls.yml
 
+- name: Configure Transit seal credentials
+  ansible.builtin.include_tasks: transit.yml
+  when: vault_transit_seal_enabled
+
 - name: Deploy vault.hcl configuration
   ansible.builtin.template:
     src: vault.hcl.j2

@@ -1,0 +1,45 @@
+---
+- name: Check local Transit seal token
+  ansible.builtin.stat:
+    path: "{{ vault_transit_token_local_file }}"
+  delegate_to: localhost
+  become: false
+  register: vault_transit_token_file
+
+- name: Require Transit seal token before changing Vault configuration
+  ansible.builtin.assert:
+    that: vault_transit_token_file.stat.exists
+    fail_msg: Нет Transit seal token на управляющей машине.
+
+- name: Install Transit seal token environment
+  ansible.builtin.copy:
+    content: "VAULT_TOKEN={{ lookup('ansible.builtin.file', vault_transit_token_local_file) | trim }}\n"
+    dest: /etc/vault.d/transit-seal.env
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart vault
+
+- name: Create systemd override directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/vault.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Load Transit seal token into Vault service
+  ansible.builtin.copy:
+    content: "[Service]\nEnvironmentFile=/etc/vault.d/transit-seal.env\n"
+    dest: /etc/systemd/system/vault.service.d/transit-seal.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: vault_transit_systemd_override
+  notify: Restart vault
+
+- name: Reload systemd after override change
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: vault_transit_systemd_override.changed

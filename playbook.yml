@@ -1,4 +1,10 @@
 ---
+- name: Prepare dedicated Transit seal provider
+  hosts: transit
+  become: true
+  roles:
+    - transit_vault
+
 - name: Create HashiCorp vault
   hosts: vaults
   become: true

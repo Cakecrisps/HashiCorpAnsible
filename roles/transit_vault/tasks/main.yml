@@ -1,0 +1,75 @@
+---
+- name: Install Vault prerequisites
+  ansible.builtin.apt:
+    name: [gnupg, ca-certificates, lsb-release]
+    state: present
+    update_cache: true
+
+- name: Download HashiCorp apt key
+  ansible.builtin.get_url:
+    url: https://apt.releases.hashicorp.com/gpg
+    dest: /tmp/hashicorp.gpg.asc
+    mode: "0644"
+
+- name: Install HashiCorp apt keyring
+  ansible.builtin.command: gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg /tmp/hashicorp.gpg.asc
+  args:
+    creates: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+- name: Add HashiCorp apt repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main"
+    filename: hashicorp
+    state: present
+
+- name: Install Vault
+  ansible.builtin.apt:
+    name: vault
+    state: present
+    update_cache: true
+
+- name: Create transit data directory
+  ansible.builtin.file:
+    path: "{{ transit_data_dir }}"
+    state: directory
+    owner: vault
+    group: vault
+    mode: "0750"
+
+- name: Create transit TLS directory
+  ansible.builtin.file:
+    path: "{{ transit_tls_dir }}"
+    state: directory
+    owner: vault
+    group: vault
+    mode: "0750"
+
+- name: Generate transit TLS material
+  ansible.builtin.include_tasks: tls.yml
+
+- name: Configure standalone transit Vault
+  ansible.builtin.template:
+    src: vault.hcl.j2
+    dest: /etc/vault.d/vault.hcl
+    owner: vault
+    group: vault
+    mode: "0640"
+  notify: Restart transit vault
+
+- name: Allow Vault to lock memory
+  community.general.capabilities:
+    path: /usr/bin/vault
+    capability: cap_ipc_lock+ep
+    state: present
+
+- name: Enable and start transit Vault
+  ansible.builtin.systemd:
+    name: vault
+    enabled: true
+    state: started
+
+- name: Apply Vault configuration before initialization
+  ansible.builtin.meta: flush_handlers
+
+- name: Initialize transit Vault and configure key
+  ansible.builtin.include_tasks: init.yml

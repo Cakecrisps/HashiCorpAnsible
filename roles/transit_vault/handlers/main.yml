@@ -1,0 +1,5 @@
+---
+- name: Restart transit vault
+  ansible.builtin.systemd:
+    name: vault
+    state: restarted

@@ -3,3 +3,8 @@ vault_data_dir: /opt/vault/data
 vault_tls_dir: /opt/vault/tls
 
 vault_pki_local_dir: "{{ lookup('env', 'HOME') }}/vault-lab-secrets/pki"
+vault_transit_seal_enabled: false
+vault_transit_seal_address: https://192.168.122.34:8200
+vault_transit_seal_mount_path: transit/
+vault_transit_seal_key_name: autounseal
+vault_transit_token_local_file: "{{ lookup('env', 'HOME') }}/vault-lab-secrets/transit-seal.token"

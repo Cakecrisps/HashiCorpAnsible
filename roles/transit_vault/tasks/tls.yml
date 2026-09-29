@@ -1,0 +1,93 @@
+---
+- name: Create local PKI directory
+  ansible.builtin.file:
+    path: "{{ transit_pki_local_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Generate lab CA private key
+  community.crypto.openssl_privatekey:
+    path: "{{ transit_pki_local_dir }}/ca.key"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+
+- name: Generate lab CA CSR
+  community.crypto.openssl_csr:
+    path: "{{ transit_pki_local_dir }}/ca.csr"
+    privatekey_path: "{{ transit_pki_local_dir }}/ca.key"
+    common_name: Vault Lab Root CA
+    basic_constraints: ["CA:TRUE"]
+    basic_constraints_critical: true
+    key_usage: ["keyCertSign", "cRLSign"]
+    key_usage_critical: true
+  delegate_to: localhost
+  become: false
+
+- name: Self-sign lab CA certificate
+  community.crypto.x509_certificate:
+    path: "{{ transit_pki_local_dir }}/ca.crt"
+    csr_path: "{{ transit_pki_local_dir }}/ca.csr"
+    privatekey_path: "{{ transit_pki_local_dir }}/ca.key"
+    provider: selfsigned
+  delegate_to: localhost
+  become: false
+
+- name: Generate transit private key
+  community.crypto.openssl_privatekey:
+    path: "{{ transit_pki_local_dir }}/transit.key"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+
+- name: Generate transit CSR
+  community.crypto.openssl_csr:
+    path: "{{ transit_pki_local_dir }}/transit.csr"
+    privatekey_path: "{{ transit_pki_local_dir }}/transit.key"
+    common_name: transit-vault.lab.local
+    subject_alt_name:
+      - "IP:{{ ansible_host }}"
+      - IP:127.0.0.1
+      - DNS:localhost
+      - DNS:transit-vault.lab.local
+  delegate_to: localhost
+  become: false
+
+- name: Sign transit certificate with lab CA
+  community.crypto.x509_certificate:
+    path: "{{ transit_pki_local_dir }}/transit.crt"
+    csr_path: "{{ transit_pki_local_dir }}/transit.csr"
+    provider: ownca
+    ownca_path: "{{ transit_pki_local_dir }}/ca.crt"
+    ownca_privatekey_path: "{{ transit_pki_local_dir }}/ca.key"
+  delegate_to: localhost
+  become: false
+
+- name: Copy CA to transit Vault
+  ansible.builtin.copy:
+    src: "{{ transit_pki_local_dir }}/ca.crt"
+    dest: "{{ transit_tls_dir }}/ca.crt"
+    owner: vault
+    group: vault
+    mode: "0644"
+  notify: Restart transit vault
+
+- name: Copy transit certificate
+  ansible.builtin.copy:
+    src: "{{ transit_pki_local_dir }}/transit.crt"
+    dest: "{{ transit_tls_dir }}/transit.crt"
+    owner: vault
+    group: vault
+    mode: "0644"
+  notify: Restart transit vault
+
+- name: Copy transit private key
+  ansible.builtin.copy:
+    src: "{{ transit_pki_local_dir }}/transit.key"
+    dest: "{{ transit_tls_dir }}/transit.key"
+    owner: vault
+    group: vault
+    mode: "0640"
+  notify: Restart transit vault

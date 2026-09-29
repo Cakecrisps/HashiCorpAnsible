@@ -31,8 +31,8 @@
 - name: Initialize the cluster (only on the leader, only if truly not done yet)
   ansible.builtin.command: >
     vault operator init
-    -key-shares={{ vault_unseal_key_shares }}
-    -key-threshold={{ vault_unseal_key_threshold }}
+    {{ '-recovery-shares=' if vault_transit_seal_enabled else '-key-shares=' }}{{ vault_unseal_key_shares }}
+    {{ '-recovery-threshold=' if vault_transit_seal_enabled else '-key-threshold=' }}{{ vault_unseal_key_threshold }}
     -format=json
   environment: "{{ vault_env }}"
   register: vault_init_raw
@@ -41,6 +41,7 @@
     - not vault_status.initialized
     - not vault_init_file.stat.exists
   run_once: true
+  no_log: true
 
 - name: Persist init output locally (control node only, mode 0600) — KEEP SECRET, do not commit
   ansible.builtin.copy:
@@ -51,6 +52,7 @@
   become: false
   run_once: true
   when: vault_init_raw is not skipped
+  no_log: true
 
 - name: Re-check local init file (in case we just created it above)
   ansible.builtin.stat:
@@ -63,7 +65,10 @@
 - name: Load unseal keys from the local init file (works on every run, not just the first)
   ansible.builtin.set_fact:
     vault_init_result: "{{ lookup('ansible.builtin.file', vault_secrets_local_dir + '/vault-init.json') | from_json }}"
-  when: vault_init_file2.stat.exists
+  when:
+    - vault_init_file2.stat.exists
+    - not vault_transit_seal_enabled
+  no_log: true
 
 - name: Fail clearly if we have no keys at all and something needs unsealing
   ansible.builtin.fail:
@@ -73,6 +78,7 @@
       инициализирован не через эту роль, либо файл был удалён/перемещён.
   when:
     - vault_status.sealed
+    - not vault_transit_seal_enabled
     - vault_init_result is not defined
 
 # --- Шаг 1: распечатываем ТОЛЬКО лидера ---
@@ -80,9 +86,10 @@
 - name: Unseal the leader node (it already has local raft data, no join needed)
   ansible.builtin.command: "vault operator unseal {{ item }}"
   environment: "{{ vault_env }}"
-  loop: "{{ vault_init_result.unseal_keys_hex[:vault_unseal_key_threshold] }}"
+  loop: "{{ (vault_init_result | default({})).get('unseal_keys_hex', [])[:vault_unseal_key_threshold] }}"
   when:
     - inventory_hostname == groups['vaults'][0]
+    - not vault_transit_seal_enabled
     - vault_init_result is defined
   no_log: true
 
@@ -127,9 +134,10 @@
 - name: Unseal follower nodes
   ansible.builtin.command: "vault operator unseal {{ item }}"
   environment: "{{ vault_env }}"
-  loop: "{{ vault_init_result.unseal_keys_hex[:vault_unseal_key_threshold] }}"
+  loop: "{{ (vault_init_result | default({})).get('unseal_keys_hex', [])[:vault_unseal_key_threshold] }}"
   when:
     - inventory_hostname != groups['vaults'][0]
+    - not vault_transit_seal_enabled
     - vault_init_result is defined
     - (vault_status_wait.stdout | from_json).sealed
   no_log: true

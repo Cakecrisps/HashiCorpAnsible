@@ -10,6 +10,15 @@ storage "raft" {
 {% endfor %}
 }
 
+{% if vault_transit_seal_enabled %}
+seal "transit" {
+  address     = "{{ vault_transit_seal_address }}"
+  mount_path  = "{{ vault_transit_seal_mount_path }}"
+  key_name    = "{{ vault_transit_seal_key_name }}"
+  tls_ca_cert = "{{ vault_tls_dir }}/ca.crt"
+}
+{% endif %}
+
 listener "tcp" {
   address       = "0.0.0.0:8200"
   tls_cert_file = "{{ vault_tls_dir }}/vault.crt"

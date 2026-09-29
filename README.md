@@ -6,6 +6,18 @@ Ansible-проект для автоматизированного развёр�
 
 ## Архитектура
 
+Отдельный Vault на `192.168.122.34` хранит Transit-ключ для auto-unseal
+основного кластера. Он использует собственные Shamir-ключи и должен быть
+распечатан первым после перезапуска. Основные три ноды после этого
+распечатываются автоматически. Transit Vault не зависит от основного кластера.
+
+Единственная транзитная ВМ остаётся точкой отказа для перезапуска и unseal
+основного кластера: пока она sealed или недоступна, новые старты основных
+нод не смогут завершить auto-unseal. Уже работающие ноды продолжают работу.
+Сохраняйте резервные копии данных транзитного Vault (`/opt/vault/transit-data`)
+и его Shamir-ключей отдельно: потеря Transit-ключа заблокирует последующие
+старты основного кластера даже при наличии его Raft snapshot.
+
 ```text
                          ┌─────────────────────┐
                          │      Nginx LB        │
@@ -38,7 +50,8 @@ Ansible-проект для автоматизированного развёр�
 | **Nginx**           | TCP Load Balancer перед Vault                    |
 | **TLS**             | Шифрование соединений                            |
 | `vault_node`        | Установка и настройка Vault                      |
-| `vault_init`        | Инициализация и unseal кластера                  |
+| `vault_init`        | Инициализация и проверка состояния кластера     |
+| `transit_vault`     | Отдельный Vault с Transit-ключом                 |
 | `nginx_lb`          | Настройка Nginx в качестве Load Balancer         |
 
 ## Структура репозитория
@@ -185,29 +198,9 @@ Role `vault_node` выполняет:
     - vault_init
 ```
 
-Процесс инициализации:
-
-```text
-Проверка состояния Vault
-        │
-        ▼
-Инициализация первой Vault-ноды
-        │
-        ▼
-Сохранение результата инициализации
-        │
-        ▼
-Unseal первой ноды
-        │
-        ▼
-Проверка состояния Leader
-        │
-        ▼
-Подключение остальных нод через Raft
-        │
-        ▼
-Unseal остальных нод
-```
+После запуска Transit Vault первая нода основного кластера инициализируется
+с recovery keys, автоматически снимает seal и принимает остальные Raft-ноды.
+После присоединения они также снимают seal автоматически.
 
 Результат инициализации сохраняется на Ansible Control Node:
 
@@ -221,9 +214,9 @@ vault-init.json
 0600
 ```
 
-> **Важно:** этот файл содержит чувствительную информацию, включая материалы, необходимые для unseal Vault. Его нельзя добавлять в Git.
+> **Важно:** этот файл содержит чувствительную информацию, включая recovery keys и root token Vault. Его нельзя добавлять в Git.
 
-Для операций с unseal keys используется `no_log: true`, чтобы ключи не попадали в вывод Ansible.
+Для операций с ключами и токенами используется `no_log: true`, чтобы они не попадали в вывод Ansible.
 
 ### 3. Настройка Nginx
 
@@ -311,41 +304,50 @@ vault_unseal_key_shares:
 vault_unseal_key_threshold:
 ```
 
-После инициализации необходимые unseal keys используются для снятия seal с Vault-нод.
+При Transit seal эти параметры задают количество recovery keys и порог.
+Они нужны для привилегированных recovery-операций, а при старте основные
+ноды обращаются к транзитному Vault.
 
 ### Порядок запуска
 
 ```text
-                 ┌────────────────────┐
-                 │ Vault не инициализирован │
-                 └──────────┬─────────┘
-                            │
-                            ▼
-                  ┌──────────────────┐
-                  │ vault operator   │
-                  │       init       │
-                  └────────┬─────────┘
-                           │
-                           ▼
-                    Первый Leader
-                           │
-                           ▼
-                         Unseal
-                           │
-                           ▼
-                  Leader подтверждён
-                           │
-                           ▼
-                  Followers Join Raft
-                           │
-                           ▼
-                  Unseal Followers
-                           │
-                           ▼
-                   Vault Cluster
+Transit Vault unsealed → Основной leader auto-unsealed → Followers join Raft → Followers auto-unsealed
 ```
 
-Такой порядок предотвращает ситуацию, когда follower пытается подключиться к Leader до завершения его инициализации и unseal.
+## Transit auto-unseal
+
+Обычный запуск `ansible-playbook -i inventory.ini playbook.yml --ask-become-pass`
+сначала приводит в рабочее состояние Transit Vault, затем настраивает
+основной кластер. Transit seal включён в `group_vars/vaults.yml`.
+
+На управляющей машине вне репозитория хранятся:
+
+* `~/vault-lab-secrets/transit-init.json` — Shamir-ключи и root token транзитного Vault;
+* `~/vault-lab-secrets/transit-seal.token` — ограниченный периодический токен основного кластера;
+* `~/vault-lab-secrets/vault-pre-transit.snap` — Raft snapshot до миграции;
+* `~/vault-lab-secrets/vault-init.json` — исходные ключи основного кластера, после миграции используемые как recovery keys.
+
+В конфигурацию Vault токен не записывается: systemd загружает его из
+`/etc/vault.d/transit-seal.env` с правами `0600`. Политика токена разрешает
+только `transit/encrypt/autounseal` и `transit/decrypt/autounseal`.
+
+После перезапуска транзитной ВМ её нужно распечатать тремя ключами из
+`transit-init.json`. На самой ВМ выполните эту команду три раза, вводя
+разные ключи по запросу:
+
+```bash
+sudo env VAULT_ADDR=https://127.0.0.1:8200 \
+  VAULT_CACERT=/opt/vault/tls/ca.crt vault operator unseal
+```
+
+Затем основные ноды смогут auto-unseal при старте.
+
+Для уже инициализированного Shamir-кластера предусмотрен одноразовый
+`migrate-transit.yml`: он сохраняет snapshot, проверяет Transit и переводит
+standby-ноды по одной, затем бывшего лидера. Повторная миграция не нужна.
+Миграция seal требует краткого простоя. [Порядок миграции](https://developer.hashicorp.com/vault/docs/concepts/seal#seal-migration)
+и [ограничения Transit auto-unseal](https://developer.hashicorp.com/vault/docs/configuration/seal/transit-best-practices)
+описаны в документации HashiCorp.
 
 ## TLS
 

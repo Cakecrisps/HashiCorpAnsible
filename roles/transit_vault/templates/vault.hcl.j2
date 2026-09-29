@@ -1,0 +1,13 @@
+storage "file" {
+  path = "{{ transit_data_dir }}"
+}
+
+listener "tcp" {
+  address       = "0.0.0.0:8200"
+  tls_cert_file = "{{ transit_tls_dir }}/transit.crt"
+  tls_key_file  = "{{ transit_tls_dir }}/transit.key"
+}
+
+api_addr     = "https://{{ ansible_host }}:8200"
+ui           = true
+disable_mlock = false

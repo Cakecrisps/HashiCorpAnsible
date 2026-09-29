@@ -1,0 +1,11 @@
+---
+transit_data_dir: /opt/vault/transit-data
+transit_tls_dir: /opt/vault/tls
+transit_pki_local_dir: "{{ lookup('env', 'HOME') }}/vault-lab-secrets/pki"
+transit_secrets_local_dir: "{{ lookup('env', 'HOME') }}/vault-lab-secrets"
+transit_key_name: autounseal
+transit_mount_path: transit
+transit_token_period: 24h
+transit_env:
+  VAULT_ADDR: https://127.0.0.1:8200
+  VAULT_CACERT: "{{ transit_tls_dir }}/ca.crt"

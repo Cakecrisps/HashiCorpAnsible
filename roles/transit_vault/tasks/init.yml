@@ -1,0 +1,173 @@
+---
+- name: Create local secret directory
+  ansible.builtin.file:
+    path: "{{ transit_secrets_local_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Check transit initialization file
+  ansible.builtin.stat:
+    path: "{{ transit_secrets_local_dir }}/transit-init.json"
+  delegate_to: localhost
+  become: false
+  register: transit_init_file
+
+- name: Get transit Vault status
+  ansible.builtin.command: vault status -format=json
+  environment: "{{ transit_env }}"
+  register: transit_status_raw
+  changed_when: false
+  failed_when: false
+
+- name: Require a valid transit Vault status
+  ansible.builtin.assert:
+    that: transit_status_raw.stdout | from_json is mapping
+    fail_msg: Transit Vault не отвечает по TLS. Проверьте сервис и сертификат.
+
+- name: Parse transit Vault status
+  ansible.builtin.set_fact:
+    transit_status: "{{ transit_status_raw.stdout | from_json }}"
+
+- name: Reject mismatched transit storage and saved keys
+  ansible.builtin.assert:
+    that: not (transit_init_file.stat.exists and not transit_status.initialized)
+    fail_msg: Локальный transit-init.json существует, но Vault на транзитной ВМ не инициализирован. Проверьте storage до продолжения.
+
+- name: Initialize transit Vault
+  ansible.builtin.command: vault operator init -key-shares=5 -key-threshold=3 -format=json
+  environment: "{{ transit_env }}"
+  register: transit_init_raw
+  when: not transit_status.initialized
+  no_log: true
+
+- name: Save transit init material locally
+  ansible.builtin.copy:
+    content: "{{ transit_init_raw.stdout }}"
+    dest: "{{ transit_secrets_local_dir }}/transit-init.json"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  when: transit_init_raw is not skipped
+  no_log: true
+
+- name: Require saved transit init material
+  ansible.builtin.stat:
+    path: "{{ transit_secrets_local_dir }}/transit-init.json"
+  delegate_to: localhost
+  become: false
+  register: transit_init_file_final
+
+- name: Stop if transit keys are unavailable
+  ansible.builtin.assert:
+    that: transit_init_file_final.stat.exists
+    fail_msg: Нет transit-init.json; без ключей нельзя безопасно настроить Transit seal.
+
+- name: Load saved transit init material
+  ansible.builtin.set_fact:
+    transit_init_result: "{{ lookup('ansible.builtin.file', transit_secrets_local_dir + '/transit-init.json') | from_json }}"
+  no_log: true
+
+- name: Unseal transit Vault with its own Shamir keys
+  ansible.builtin.command: "vault operator unseal {{ item }}"
+  environment: "{{ transit_env }}"
+  loop: "{{ transit_init_result.unseal_keys_hex[:3] }}"
+  when: transit_status.sealed
+  no_log: true
+
+- name: Check transit Vault is unsealed
+  ansible.builtin.command: vault status -format=json
+  environment: "{{ transit_env }}"
+  register: transit_ready_raw
+  changed_when: false
+
+- name: Require unsealed transit Vault
+  ansible.builtin.assert:
+    that: not (transit_ready_raw.stdout | from_json).sealed
+
+- name: Set root environment for transit setup
+  ansible.builtin.set_fact:
+    transit_root_env: "{{ transit_env | combine({'VAULT_TOKEN': transit_init_result.root_token}) }}"
+  no_log: true
+
+- name: List transit mounts
+  ansible.builtin.command: vault secrets list -format=json
+  environment: "{{ transit_root_env }}"
+  register: transit_mounts_raw
+  changed_when: false
+  no_log: true
+
+- name: Enable transit secrets engine
+  ansible.builtin.command: "vault secrets enable -path={{ transit_mount_path }} transit"
+  environment: "{{ transit_root_env }}"
+  when: (transit_mount_path + '/') not in (transit_mounts_raw.stdout | from_json)
+  no_log: true
+
+- name: Read auto-unseal key
+  ansible.builtin.command: "vault read -format=json {{ transit_mount_path }}/keys/{{ transit_key_name }}"
+  environment: "{{ transit_root_env }}"
+  register: transit_key_raw
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Create auto-unseal key
+  ansible.builtin.command: "vault write -f {{ transit_mount_path }}/keys/{{ transit_key_name }}"
+  environment: "{{ transit_root_env }}"
+  when: transit_key_raw.rc != 0
+  no_log: true
+
+- name: Deploy minimal auto-unseal policy
+  ansible.builtin.template:
+    src: autounseal-policy.hcl.j2
+    dest: /etc/vault.d/autounseal-policy.hcl
+    owner: root
+    group: root
+    mode: "0644"
+  register: transit_policy_file
+
+- name: Apply auto-unseal policy
+  ansible.builtin.command: vault policy write autounseal /etc/vault.d/autounseal-policy.hcl
+  environment: "{{ transit_root_env }}"
+  when: transit_policy_file.changed
+  no_log: true
+
+- name: Check local seal token
+  ansible.builtin.stat:
+    path: "{{ transit_secrets_local_dir }}/transit-seal.token"
+  delegate_to: localhost
+  become: false
+  register: transit_token_file
+
+- name: Load existing seal token
+  ansible.builtin.set_fact:
+    transit_existing_token: "{{ lookup('ansible.builtin.file', transit_secrets_local_dir + '/transit-seal.token') | trim }}"
+  when: transit_token_file.stat.exists
+  no_log: true
+
+- name: Validate existing seal token
+  ansible.builtin.command: vault token lookup -format=json
+  environment: "{{ transit_env | combine({'VAULT_TOKEN': transit_existing_token}) }}"
+  register: transit_token_lookup
+  changed_when: false
+  failed_when: false
+  when: transit_existing_token is defined
+  no_log: true
+
+- name: Create orphan periodic seal token
+  ansible.builtin.command: "vault token create -orphan -period={{ transit_token_period }} -policy=autounseal -format=json"
+  environment: "{{ transit_root_env }}"
+  register: transit_token_raw
+  when: transit_existing_token is not defined or transit_token_lookup.rc != 0
+  no_log: true
+
+- name: Save seal token locally
+  ansible.builtin.copy:
+    content: "{{ (transit_token_raw.stdout | from_json).auth.client_token }}\n"
+    dest: "{{ transit_secrets_local_dir }}/transit-seal.token"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  when: transit_token_raw is not skipped
+  no_log: true
