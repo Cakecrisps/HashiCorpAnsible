@@ -60,7 +60,10 @@ Ansible-проект для автоматизированного развёр�
 .
 ├── inventory.ini
 ├── playbook.yml
-├── requriments.yml
+├── migrate-transit.yml
+├── requirements.yml
+├── group_vars/
+│   └── vaults.yml
 └── roles/
     ├── vault_node/
     │   ├── tasks/
@@ -69,18 +72,10 @@ Ansible-проект для автоматизированного развёр�
     │   └── ...
     │
     ├── vault_init/
-    │   ├── tasks/
-    │   ├── handlers/
-    │   └── ...
-    │
+    ├── vault_seal_migrate/
+    ├── transit_vault/
     └── nginx_lb/
-        ├── tasks/
-        ├── handlers/
-        ├── templates/
-        └── ...
 ```
-
-> **Примечание:** файл `requriments.yml` назван с опечаткой. Стандартное имя для файла зависимостей Ansible — `requirements.yml`.
 
 ## Требования
 
@@ -92,12 +87,12 @@ Ansible-проект для автоматизированного развёр�
 * Python
 * SSH-клиент
 * SSH-доступ ко всем целевым серверам
-* Ansible Collections, указанные в `requriments.yml`
+* Ansible Collections, указанные в `requirements.yml`
 
 Установить Collections:
 
 ```bash
-ansible-galaxy collection install -r requriments.yml
+ansible-galaxy collection install -r requirements.yml
 ```
 
 Используемые Collections:
@@ -148,7 +143,7 @@ Vault3 ansible_host=192.168.122.181
 NginxLB ansible_host=192.168.122.72
 ```
 
-SSH-пользователь, приватный ключ и настройки privilege escalation задаются в `inventory.ini`.
+SSH-пользователь `k4ips` и настройки privilege escalation задаются в `inventory.ini`.
 
 ### Безопасность
 
@@ -264,31 +259,31 @@ cd HashiCorpAnsible
 Устанавливаем Ansible Collections:
 
 ```bash
-ansible-galaxy collection install -r requriments.yml
+ansible-galaxy collection install -r requirements.yml
 ```
 
 Проверяем доступность серверов:
 
 ```bash
-ansible -i inventory.ini all -m ping
+ansible -i inventory.ini all -m ping --ask-become-pass
 ```
 
 Запускаем развёртывание:
 
 ```bash
-ansible-playbook -i inventory.ini playbook.yml
+ansible-playbook -i inventory.ini playbook.yml --ask-become-pass
 ```
 
 Для получения дополнительной информации:
 
 ```bash
-ansible-playbook -i inventory.ini playbook.yml -v
+ansible-playbook -i inventory.ini playbook.yml --ask-become-pass -v
 ```
 
 Для детальной диагностики:
 
 ```bash
-ansible-playbook -i inventory.ini playbook.yml -vvv
+ansible-playbook -i inventory.ini playbook.yml --ask-become-pass -vvv
 ```
 
 ## Bootstrap Vault-кластера
@@ -592,7 +587,7 @@ vault operator init
 Поэтому после изменения конфигурации можно повторно выполнить:
 
 ```bash
-ansible-playbook -i inventory.ini playbook.yml
+ansible-playbook -i inventory.ini playbook.yml --ask-become-pass
 ```
 
 и Ansible синхронизирует инфраструктуру с описанной конфигурацией.
@@ -622,36 +617,16 @@ ansible-inventory \
 ansible-playbook \
   -i inventory.ini \
   playbook.yml \
-  --check
+  --check --ask-become-pass
 ```
 
 Для разработки рекомендуется использовать отдельные тестовые VM, а не существующий production Vault-кластер.
 
 ## Известные моменты
 
-### `requriments.yml`
-
-Сейчас файл называется:
-
-```text
-requriments.yml
-```
-
-Рекомендуется переименовать его в стандартный:
-
-```text
-requirements.yml
-```
-
-После этого установка Collections будет выглядеть привычнее:
-
-```bash
-ansible-galaxy collection install -r requirements.yml
-```
-
 ### `inventory.ini`
 
-В текущем inventory присутствуют конкретные IP-адреса инфраструктуры и путь к SSH-ключу.
+В текущем inventory присутствуют конкретные IP-адреса инфраструктуры и SSH-пользователь.
 
 Перед публикацией репозитория стоит убедиться, что:
 
