@@ -356,8 +356,18 @@ Vault-ноды используют TLS для защищённого взаим
 ```text
 /etc/vault.d/vault.hcl
 ```
-export VAULT_ADDR=https://127.0.0.1:8200
-export VAULT_SKIP_VERIFY=true
+На управляющей машине:
+
+```bash
+export VAULT_ADDR=https://192.168.122.72:8200
+export VAULT_CACERT="$HOME/vault-lab-secrets/pki/ca.crt"
+```
+
+На другой клиентской машине укажите путь к копии этого `ca.crt`.
+Для локальной проверки от root на Vault-ноде используйте
+`VAULT_ADDR=https://127.0.0.1:8200` и `VAULT_CACERT=/opt/vault/tls/ca.crt`.
+Сертификат Vault содержит IP-адреса нод и балансировщика в SAN; Nginx
+передаёт TLS-соединение на Vault без его завершения.
 
 TLS-файлы хранятся в отдельной директории с ограниченными правами доступа.
 

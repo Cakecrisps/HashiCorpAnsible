@@ -3,7 +3,8 @@ vault_unseal_key_shares: 5
 vault_unseal_key_threshold: 3
 
 vault_secrets_local_dir: "{{ lookup('env', 'HOME') }}/vault-lab-secrets"
+vault_tls_dir: /opt/vault/tls
 
 vault_env:
   VAULT_ADDR: "https://127.0.0.1:8200"
-  VAULT_SKIP_VERIFY: "true"  # самоподписанный CA; для прод — доверенный CA-бандл вместо этого флага
+  VAULT_CACERT: "{{ vault_tls_dir }}/ca.crt"
