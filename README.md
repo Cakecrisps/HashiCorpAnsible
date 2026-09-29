@@ -356,6 +356,8 @@ Vault-ноды используют TLS для защищённого взаим
 ```text
 /etc/vault.d/vault.hcl
 ```
+export VAULT_ADDR=https://127.0.0.1:8200
+export VAULT_SKIP_VERIFY=true
 
 TLS-файлы хранятся в отдельной директории с ограниченными правами доступа.
 
