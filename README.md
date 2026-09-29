@@ -1,8 +1,8 @@
 # HashiCorp Vault Cluster с помощью Ansible
 
-Ansible-проект для автоматизированного развёртывания **кластера HashiCorp Vault из 3 узлов** с использованием **Raft Storage**, TLS, автоматической инициализации и unseal, а также **Nginx в качестве TCP Load Balancer**.
+Ansible-проект для развёртывания **основного кластера HashiCorp Vault из 3 узлов** с Raft Storage, TLS и Transit auto-unseal. Отдельная Vault-нода хранит Transit-ключ, а Nginx работает как TCP Load Balancer перед основным кластером.
 
-Проект предназначен для воспроизводимого развёртывания небольшого отказоустойчивого кластера Vault с использованием Ansible Roles.
+Проект предназначен для воспроизводимого развёртывания небольшого кластера Vault с использованием Ansible Roles.
 
 ## Архитектура
 
@@ -18,26 +18,17 @@ Ansible-проект для автоматизированного развёр�
 и его Shamir-ключей отдельно: потеря Transit-ключа заблокирует последующие
 старты основного кластера даже при наличии его Raft snapshot.
 
-```text
-                         ┌─────────────────────┐
-                         │      Nginx LB        │
-                         │     nginx_lb         │
-                         │       :8200          │
-                         └──────────┬──────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    │               │               │
-                    ▼               ▼               ▼
-             ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-             │   Vault 1   │ │   Vault 2   │ │   Vault 3   │
-             │    Raft     │ │    Raft     │ │    Raft     │
-             │   :8200     │ │   :8200     │ │   :8200     │
-             │   :8201     │ │   :8201     │ │   :8201     │
-             └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
-                    │               │               │
-                    └───────────────┼───────────────┘
-                                    │
-                              Raft Consensus
+```mermaid
+flowchart TB
+    client[Приложения, API и Web UI] --> lb[Nginx LB<br/>192.168.122.72:8200]
+    lb --> v1[Vault1<br/>192.168.122.14]
+    lb --> v2[Vault2<br/>192.168.122.176]
+    lb --> v3[Vault3<br/>192.168.122.181]
+    v1 <-->|Raft :8201| v2
+    v2 <-->|Raft :8201| v3
+    v1 -.->|Transit auto-unseal :8200| transit[Transit Vault<br/>192.168.122.34]
+    v2 -.->|Transit auto-unseal :8200| transit
+    v3 -.->|Transit auto-unseal :8200| transit
 ```
 
 ### Компоненты
@@ -117,6 +108,7 @@ collections:
 Для текущей конфигурации предполагается:
 
 * 3 Vault-ноды;
+* 1 отдельная Transit Vault-нода;
 * 1 Nginx Load Balancer;
 * SSH-доступ к серверам;
 * возможность выполнения команд через `sudo`;
@@ -141,6 +133,9 @@ Vault3 ansible_host=192.168.122.181
 
 [nginx_lb]
 NginxLB ansible_host=192.168.122.72
+
+[transit]
+TransitVault ansible_host=192.168.122.34
 ```
 
 SSH-пользователь `k4ips` и настройки privilege escalation задаются в `inventory.ini`.
@@ -159,9 +154,15 @@ SSH-пользователь `k4ips` и настройки privilege escalation 
 
 ## Как работает развёртывание
 
-Основной playbook состоит из трёх этапов.
+Основной playbook состоит из четырёх этапов.
 
-### 1. Развёртывание Vault
+### 1. Развёртывание Transit Vault
+
+Роль `transit_vault` устанавливает отдельный Vault, выпускает TLS-сертификат,
+инициализирует его с собственными Shamir-ключами и создаёт Transit-ключ
+`autounseal` с ограниченным токеном для основных нод.
+
+### 2. Развёртывание основного Vault-кластера
 
 ```yaml
 - name: Create HashiCorp vault
@@ -183,7 +184,7 @@ Role `vault_node` выполняет:
 8. Настройку capability `cap_ipc_lock`.
 9. Включение и запуск systemd-сервиса Vault.
 
-### 2. Инициализация и unseal
+### 3. Инициализация и auto-unseal
 
 ```yaml
 - name: Vault cluster — init and unseal
@@ -213,7 +214,7 @@ vault-init.json
 
 Для операций с ключами и токенами используется `no_log: true`, чтобы они не попадали в вывод Ansible.
 
-### 3. Настройка Nginx
+### 4. Настройка Nginx
 
 ```yaml
 - name: NginxLb
@@ -231,7 +232,9 @@ Role `nginx_lb`:
 * проверяет конфигурацию через `nginx -t`;
 * включает и запускает Nginx.
 
-Nginx работает как **TCP proxy** перед Vault.
+Nginx работает как **TCP proxy** перед основным Vault-кластером. Следующая
+схема показывает только маршрут клиентских запросов; соединения основных
+нод с Transit Vault показаны в общей схеме архитектуры выше.
 
 ```text
 Client
@@ -377,6 +380,145 @@ TLS-файлы хранятся в отдельной директории с о
 * корректный CA;
 * SAN в сертификатах.
 
+## Использование секретов
+
+Клиенты подключаются к основному кластеру через
+`https://192.168.122.72:8200`. Отдельный Transit Vault на
+`192.168.122.34` используется только для auto-unseal; секреты приложений
+создаются в основном кластере.
+
+### Web UI и HTTP API
+
+Web UI доступен по адресу `https://192.168.122.72:8200/ui/`. Клиентский
+браузер должен доверять CA из `~/vault-lab-secrets/pki/ca.crt`. На других
+машинах используется копия этого сертификата CA.
+
+Для пробного секрета в Web UI откройте **Secrets → Enable new engine → KV**,
+выберите **Version 2** и путь монтирования `demo`. Затем создайте секрет
+`demo-secret` с тестовыми полями. Если движок `demo/` уже существует,
+создайте секрет в нём.
+
+При KV v2 путь в интерфейсе `demo/demo-secret` соответствует HTTP API
+`/v1/demo/data/demo-secret`. Токен с политикой `read` на этом API-пути
+может получить значение напрямую, без отдельного запроса входа:
+
+```bash
+VAULT_ADDR=https://192.168.122.72:8200
+VAULT_CACERT="$HOME/vault-lab-secrets/pki/ca.crt"
+# VAULT_TOKEN — отдельный токен с доступом к нужному пути.
+curl --fail --silent --show-error --cacert "$VAULT_CACERT" \
+  -H "X-Vault-Token: $VAULT_TOKEN" \
+  "$VAULT_ADDR/v1/demo/data/demo-secret"
+```
+
+Политика для чтения одного секрета:
+
+```hcl
+path "demo/data/demo-secret" {
+  capabilities = ["read"]
+}
+```
+
+Для KV v2 чтение значений выполняется через `data/`, а просмотр списка
+ключей — через `metadata/`. Токен выдаётся приложению отдельно от root
+token и получает только необходимые права. [API KV v2](https://developer.hashicorp.com/vault/api-docs/secret/kv/kv-v2),
+[ACL-политики](https://developer.hashicorp.com/vault/docs/concepts/policies).
+
+### Vault Agent на сервере приложения: существующий пароль БД
+
+Этот сценарий переносит уже существующий пароль БД в KV v2. Например,
+секрет `secret/myapp/db` содержит поле `password`; имя пользователя БД
+остаётся в конфигурации приложения. Путь монтирования `secret/` нужно
+создать заранее, если его ещё нет.
+
+Vault Agent устанавливается **на сервере приложения**. Отдельная AppRole
+для приложения получает политику:
+
+```hcl
+path "secret/data/myapp/db" {
+  capabilities = ["read"]
+}
+```
+
+RoleID и SecretID этой AppRole доставляются на сервер приложения отдельно.
+Agent работает от учётной записи приложения, а файлы с RoleID и SecretID
+доступны только этой записи. Пример `/etc/myapp-vault/agent.hcl`:
+
+```hcl
+vault {
+  address = "https://192.168.122.72:8200"
+  ca_cert = "/etc/myapp-vault/ca.crt"
+}
+
+auto_auth {
+  method {
+    type = "approle"
+    config = {
+      role_id_file_path = "/etc/myapp-vault/role_id"
+      secret_id_file_path = "/etc/myapp-vault/secret_id"
+      remove_secret_id_file_after_reading = false
+    }
+  }
+}
+
+template_config {
+  static_secret_render_interval = "5m"
+}
+
+template {
+  contents = "{{ with secret \"secret/data/myapp/db\" }}{{ .Data.data.password }}{{ end }}"
+  destination = "/run/myapp/db-password"
+  perms = "0600"
+  backup = false
+  error_on_missing_key = true
+}
+```
+
+Если Agent используется только для шаблона, отдельный файл с Vault token
+не нужен: Agent получает и обновляет токен сам. Каталог `/run/myapp`
+должен существовать и быть доступен учётной записи приложения. Agent
+запускается как постоянный systemd-сервис; приложение стартует после
+появления `/run/myapp/db-password` и перечитывает файл при изменении.
+Для приложения без перечитывания настраивается контролируемый reload через
+`template.exec`. Без reload смена файла не меняет уже открытые соединения
+с БД. [Vault Agent auto-auth](https://developer.hashicorp.com/vault/docs/agent-and-proxy/autoauth),
+[шаблоны Agent](https://developer.hashicorp.com/vault/docs/agent-and-proxy/agent/template).
+
+Параметр `remove_secret_id_file_after_reading = false` сохраняет SecretID
+для повторного входа Agent после перезапуска VM. Поэтому SecretID должен
+иметь ограниченный доступ и плановую замену. Одноразовый SecretID без
+механизма повторной доставки не обеспечит автоматический запуск после
+перезагрузки. [AppRole auto-auth](https://developer.hashicorp.com/vault/docs/agent-and-proxy/autoauth/methods/approle).
+
+Запись нового значения в KV v2 **не меняет пароль в самой БД**. При
+переходе со старой конфигурации сначала проверяется чтение файла и
+подключение тестового экземпляра, затем переключаются остальные
+экземпляры и меняется пароль в БД с согласованным обновлением Vault.
+
+### Учётные данные, которыми управляет Vault
+
+Для автоматической ротации используется [Database secrets engine](https://developer.hashicorp.com/vault/docs/secrets/databases):
+
+* **Static role** закрепляет за ролью существующего пользователя БД и
+  меняет его пароль по расписанию. Приложение должно подхватывать новый
+  пароль и обновлять соединения.
+* **Dynamic role** создаёт отдельного временного пользователя для
+  экземпляра приложения. Приложение должно заменить учётные данные
+  соединений до истечения срока действия выданного секрета.
+
+Политика приложения для динамической роли `myapp-ro`:
+
+```hcl
+path "database/creds/myapp-ro" {
+  capabilities = ["read"]
+}
+```
+
+Vault Agent может читать этот путь через шаблон и записывать имя
+пользователя и пароль в защищённые файлы. Срок действия учётных данных,
+повторное получение и реакция приложения на изменение проверяются до
+перевода рабочих экземпляров. [Поведение Agent при обновлении секретов](https://developer.hashicorp.com/vault/docs/agent-and-proxy/agent/template#renewals-and-updating-secrets).
+
 ## Конфигурация
 
 Основные параметры должны задаваться через Ansible variables.
@@ -398,27 +540,45 @@ vault_env:
 
 ### Vault
 
-Проверить systemd:
+На управляющей машине проверить TLS, LB и все Vault-ноды:
+
+```bash
+CA="$HOME/vault-lab-secrets/pki/ca.crt"
+curl --silent --show-error --cacert "$CA" \
+  -o /dev/null -w 'LB: HTTP %{http_code}, TLS %{ssl_verify_result}\n' \
+  'https://192.168.122.72:8200/v1/sys/health?standbyok=true'
+
+for IP in 192.168.122.14 192.168.122.176 192.168.122.181; do
+  echo "=== $IP ==="
+  curl --fail --silent --show-error --cacert "$CA" \
+    "https://$IP:8200/v1/sys/seal-status"
+  echo
+done
+```
+
+Для каждой основной ноды ожидаются `"type":"transit"` и
+`"sealed":false`. У LB ожидаются HTTP `200` и TLS `0`.
+
+Отдельно проверить Transit Vault:
+
+```bash
+curl --fail --silent --show-error --cacert "$CA" \
+  'https://192.168.122.34:8200/v1/sys/seal-status'
+```
+
+Для Transit Vault ожидаются `"type":"shamir"` и `"sealed":false`.
+На конкретной Vault-ноде состояние сервиса и локального API проверяется так:
 
 ```bash
 systemctl status vault
-```
-
-Проверить состояние Vault:
-
-```bash
-vault status
-```
-
-Или в JSON:
-
-```bash
-vault status -format=json
+sudo env VAULT_ADDR=https://127.0.0.1:8200 \
+  VAULT_CACERT=/opt/vault/tls/ca.crt vault status
 ```
 
 ### Raft
 
-Проверить участников кластера:
+Проверить участников основного кластера с административным Vault token
+и настроенными `VAULT_ADDR` и `VAULT_CACERT`:
 
 ```bash
 vault operator raft list-peers
@@ -462,19 +622,19 @@ nc -vz <leader-ip> 8201
 
 ### Vault находится в состоянии Sealed
 
-Проверить:
+Проверить тип seal и состояние транзитной ноды командой из раздела
+«Проверка после развёртывания». Если Transit Vault sealed, распечатать
+его **собственными** ключами из `~/vault-lab-secrets/transit-init.json`.
+Если Transit Vault работает, проверить доступность порта `8200`, CA,
+ограниченный токен в `/etc/vault.d/transit-seal.env` и журнал основной
+Vault-ноды:
 
 ```bash
-vault status
+journalctl -u vault
 ```
 
-Также проверить наличие файла:
-
-```text
-vault-init.json
-```
-
-> Не передавайте содержимое этого файла в issue, chat, логи или другие публичные системы.
+Файлы `transit-init.json` и `vault-init.json` не передаются в issue,
+чаты или логи.
 
 ### Nginx не запускается
 
@@ -637,14 +797,6 @@ ansible-playbook \
 ## Лицензия
 
 Лицензия проекта пока не указана.
-
-При необходимости добавьте, например:
-
-```text
-LICENSE
-```
-
-и укажите выбранную лицензию в этом разделе.
 
 ## Полезные ссылки
 
